@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="Bot.Application/Bot.Application.csproj" />
+  <Project Path="Bot.Console/Bot.Console.csproj" />
+  <Project Path="Bot.Domain/Bot.Domain.csproj" />
+  <Project Path="Bot.Infrastructure/Bot.Infrastructure.csproj" />
+  <Project Path="Bot.Tests/Bot.Tests.csproj" />
+</Solution>
