@@ -1,27 +1,95 @@
-﻿namespace Bot.Infrastructure.Services;
+namespace Bot.Infrastructure.Services;
 
 using Microsoft.Playwright;
+using System.Diagnostics;
+using System.Threading.Channels;
+using Microsoft.Extensions.Logging;
 using Bot.Application.Interfaces;
+using Bot.Infrastructure.Diagnostics;
 
 public class PlaywrightDiscordService : IBrowserAutomationService
 {
+    // Constantes de aplicação
+    private const string SessionFile = "discord_session.json";
+    private const string CommandPrefix = "!play ";
+    // Canal do navegador instalado no sistema (Chrome/Edge) — tem os codecs
+    // proprietários (H.264/AAC) e o Widevine que o YouTube exige. O Chromium
+    // empacotado pelo Playwright NÃO os possui e falha ao reproduzir vídeos.
+    private const string BrowserChannel = "chrome";
+
+    // Timeouts (ms) — centralizados para facilitar ajuste
+    private const int LoginFieldTimeoutMs = 10_000;
+    private const int LoginRedirectTimeoutMs = 60_000;
+    private const int NavigationTimeoutMs = 60_000;
+    private const int ModalTimeoutMs = 5_000;
+    private const int ChatLoadTimeoutMs = 45_000;
+    private const int PollIntervalMs = 2_000;
+    private const int PlaybackPollMs = 3_000;
+    private const int VideoReadyTimeoutMs = 15_000;
+    private const int VoiceJoinSettleMs = 3_000;
+    private const int VoiceButtonTimeoutMs = 5_000;
+    private const int ShareButtonTimeoutMs = 10_000;
+    private const int ShareMaxAttempts = 3;
+
+    // Tempo ocioso na chamada (fila vazia) antes de desconectar
+    private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(5);
+
+    // Seletores / rótulos da UI web do Discord (pt-BR) — dependentes de locale
+    private const string ContinueInBrowserSelector = "text=Continuar no Navegador";
+    private const string JoinVoiceButtonLabel = "Entrar na chamada de voz";
+    private const string DisconnectButtonLabel = "Desconectar";
+    private const string ShareScreenLabel = "Compartilhar sua tela";
+    private const string ChatMessageSelector = "div[data-list-item-id^='chat-messages']";
+    private const string MessageContentSelector = "div[class*='messageContent']";
+    private const string VideoSelector = "video";
+
+    // Hosts permitidos para o comando !play (mitiga navegação a URL arbitrária)
+    private static readonly string[] AllowedYouTubeHosts =
+    {
+        "youtube.com", "www.youtube.com", "m.youtube.com", "music.youtube.com", "youtu.be"
+    };
+
+    private readonly ILogger<PlaywrightDiscordService> _logger;
+
+    // Fila de reprodução (produtor: monitor do chat; consumidor: player)
+    private readonly Channel<string> _queue =
+        Channel.CreateUnbounded<string>(new UnboundedChannelOptions { SingleReader = true, SingleWriter = true });
+
     private IPlaywright? _playwright;
     private IBrowser? _browser;
     private IBrowserContext? _context;
-    private IPage? _discordPage;
-    private readonly string _sessionFile = "discord_session.json";
+    private IPage? _discordPage;   // permanece no canal de texto para o monitoramento
+    private IPage? _voicePage;     // página dedicada ao canal de voz / compartilhamento
+    private IPage? _youtubePage;   // página reutilizada do YouTube
 
-    public async Task StartBrowserAsync()
+    public PlaywrightDiscordService(ILogger<PlaywrightDiscordService> logger)
     {
+        _logger = logger;
+    }
+
+    // Guards que forçam a ordem de chamada (falha clara em vez de NullReferenceException)
+    private IBrowserContext Context =>
+        _context ?? throw new InvalidOperationException("StartBrowserAsync deve ser chamado antes desta operação.");
+
+    private IPage DiscordPage =>
+        _discordPage ?? throw new InvalidOperationException("LoginToDiscordAsync deve ser chamado antes desta operação.");
+
+    public async Task StartBrowserAsync(CancellationToken cancellationToken = default)
+    {
+        using var activity = DiagnosticsConfig.ActivitySource.StartActivity("StartBrowser");
+        cancellationToken.ThrowIfCancellationRequested();
+
         _playwright = await Playwright.CreateAsync();
 
         _browser = await _playwright.Chromium.LaunchAsync(new BrowserTypeLaunchOptions
         {
+            Channel = BrowserChannel,
             Headless = false,
             Args = new[]
             {
                 "--auto-select-desktop-capture-source=YouTube",
-                "--disable-user-media-security",
+                "--autoplay-policy=no-user-gesture-required",
+                "--disable-accelerated-video-encode",
                 "--mute-audio"
             }
         });
@@ -31,68 +99,119 @@ public class PlaywrightDiscordService : IBrowserAutomationService
             Permissions = new[] { "microphone", "camera" }
         };
 
-        if (File.Exists(_sessionFile))
+        var hasSession = File.Exists(SessionFile);
+        activity?.SetTag("session.restored", hasSession);
+        if (hasSession)
         {
-            contextOptions.StorageStatePath = _sessionFile;
-            Console.WriteLine("[INFO] Sessão salva detectada. Tentando carregar...");
+            contextOptions.StorageStatePath = SessionFile;
+            _logger.LogInformation("Sessão salva detectada. Tentando carregar...");
         }
 
         _context = await _browser.NewContextAsync(contextOptions);
+        _logger.LogInformation("Browser iniciado.");
     }
 
-    public async Task LoginToDiscordAsync(string email, string password)
+    public async Task LoginToDiscordAsync(string email, string password, CancellationToken cancellationToken = default)
     {
-        _discordPage = await _context!.NewPageAsync();
-        Console.WriteLine("[INFO] Acessando tela de login...");
+        using var activity = DiagnosticsConfig.ActivitySource.StartActivity("LoginToDiscord");
+        cancellationToken.ThrowIfCancellationRequested();
+
+        _discordPage = await Context.NewPageAsync();
+        _logger.LogInformation("Acessando tela de login...");
         await _discordPage.GotoAsync("https://discord.com/login");
 
         var emailInput = _discordPage.Locator("input[name='email']");
-        if (await emailInput.IsVisibleAsync(new() { Timeout = 10000 }))
+        if (await emailInput.IsVisibleAsync(new() { Timeout = LoginFieldTimeoutMs }))
         {
             await emailInput.FillAsync(email);
             await _discordPage.FillAsync("input[name='password']", password);
             await _discordPage.ClickAsync("button[type='submit']");
 
-            Console.WriteLine("[INFO] Aguardando autenticação...");
-            await _discordPage.WaitForURLAsync("**/channels/**", new PageWaitForURLOptions { Timeout = 60000 });
-            await _context.StorageStateAsync(new BrowserContextStorageStateOptions { Path = _sessionFile });
-            Console.WriteLine("[INFO] Login realizado e sessão salva com sucesso.");
+            _logger.LogInformation("Aguardando autenticação...");
+            await _discordPage.WaitForURLAsync("**/channels/**", new PageWaitForURLOptions { Timeout = LoginRedirectTimeoutMs });
+            await Context.StorageStateAsync(new BrowserContextStorageStateOptions { Path = SessionFile });
+            activity?.SetTag("login.performed", true);
+            _logger.LogInformation("Login realizado e sessão salva com sucesso.");
+        }
+        else
+        {
+            activity?.SetTag("login.performed", false);
+            _logger.LogInformation("Tela de login não exibida; sessão existente reutilizada.");
         }
     }
 
-    public async Task ListenForCommandsAndStreamAsync(string serverId, string textChannelId, string voiceChannelId)
+    public async Task ListenForCommandsAndStreamAsync(string serverId, string textChannelId, string voiceChannelId, CancellationToken cancellationToken = default)
     {
+        using var activity = DiagnosticsConfig.ActivitySource.StartActivity("ListenForCommands");
+        activity?.SetTag("discord.server_id", serverId);
+        activity?.SetTag("discord.text_channel_id", textChannelId);
+
         var targetUrl = $"https://discord.com/channels/{serverId}/{textChannelId}";
-        Console.WriteLine($"[INFO] Navegando para: {targetUrl}");
+        _logger.LogInformation("Navegando para: {TargetUrl}", targetUrl);
 
-        await _discordPage!.GotoAsync(targetUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle, Timeout = 60000 });
+        await DiscordPage.GotoAsync(targetUrl, new PageGotoOptions { WaitUntil = WaitUntilState.NetworkIdle, Timeout = NavigationTimeoutMs });
 
-        var continueLink = _discordPage.Locator("text=Continuar no Navegador");
-        if (await continueLink.IsVisibleAsync(new() { Timeout = 5000 }))
+        var continueLink = DiscordPage.Locator(ContinueInBrowserSelector);
+        if (await continueLink.IsVisibleAsync(new() { Timeout = ModalTimeoutMs }))
         {
-            Console.WriteLine("[INFO] Modal detectada, clicando...");
+            _logger.LogInformation("Modal detectada, clicando...");
             await continueLink.ClickAsync();
-            await _discordPage.WaitForLoadStateAsync(LoadState.NetworkIdle);
+            await DiscordPage.WaitForLoadStateAsync(LoadState.NetworkIdle);
         }
 
-        Console.WriteLine("[INFO] Aguardando carregamento do chat...");
+        _logger.LogInformation("Aguardando carregamento do chat...");
         try
         {
-            await _discordPage.WaitForSelectorAsync("div[data-list-item-id^='chat-messages']", new() { Timeout = 45000 });
+            await DiscordPage.WaitForSelectorAsync(ChatMessageSelector, new() { Timeout = ChatLoadTimeoutMs });
         }
-        catch (TimeoutException)
+        catch (TimeoutException ex)
         {
-            await _discordPage.ScreenshotAsync(new() { Path = "debug_error.png" });
-            Console.WriteLine("[ERRO] Chat não carregou. Screenshot salva como 'debug_error.png'.");
+            await DiscordPage.ScreenshotAsync(new() { Path = "debug_error.png" });
+            _logger.LogError(ex, "Chat não carregou. Screenshot salva como 'debug_error.png'.");
             throw;
         }
 
-        Console.WriteLine("[INFO] Sucesso! Chat carregado. Monitorando...");
-        string lastMessageId = "";
+        _logger.LogInformation("Sucesso! Chat carregado. Monitorando...");
 
-        while (true)
+        // Baseline: só processa comandos POSTERIORES ao boot. Sem isso, um !play
+        // antigo já presente no chat faria o bot entrar sozinho na chamada.
+        var baselineMessageId = await GetCurrentLastMessageIdAsync();
+
+        // Se um dos loops encerrar (erro/fim), cancela o outro para não travar o WhenAll.
+        using var runCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        var token = runCts.Token;
+
+        async Task GuardAsync(Func<Task> work, string name)
         {
-            var messageLocators = _discordPage.Locator("div[data-list-item-id^='chat-messages']");
+            try
+            {
+                await work();
+            }
+            catch (OperationCanceledException)
+            {
+                // encerramento normal
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Loop '{Loop}' encerrado por erro.", name);
+            }
+            finally
+            {
+                runCts.Cancel();
+            }
+        }
+
+        await Task.WhenAll(
+            GuardAsync(() => MonitorChatAsync(baselineMessageId, token), "monitor"),
+            GuardAsync(() => ProcessQueueAsync(serverId, voiceChannelId, token), "player"));
+    }
+
+    // Produtor: lê o chat e enfileira comandos !play válidos.
+    private async Task MonitorChatAsync(string lastMessageId, CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var messageLocators = DiscordPage.Locator(ChatMessageSelector);
             int count = await messageLocators.CountAsync();
 
             if (count > 0)
@@ -103,56 +222,284 @@ public class PlaywrightDiscordService : IBrowserAutomationService
                 if (messageId != null && messageId != lastMessageId)
                 {
                     lastMessageId = messageId;
-                    var textContent = await lastMessage.Locator("div[class*='messageContent']").InnerTextAsync();
+                    var textContent = await lastMessage.Locator(MessageContentSelector).InnerTextAsync();
 
-                    if (textContent.StartsWith("!play "))
+                    if (textContent.StartsWith(CommandPrefix))
                     {
-                        string youtubeUrl = textContent.Substring(6).Trim();
-                        Console.WriteLine($"[COMANDO] Recebido: {youtubeUrl}");
-                        await StartStreamingAsync(serverId, voiceChannelId, youtubeUrl);
+                        var youtubeUrl = textContent[CommandPrefix.Length..].Trim();
+
+                        if (!IsAllowedYouTubeUrl(youtubeUrl))
+                        {
+                            _logger.LogWarning("Comando ignorado — URL não permitida (apenas YouTube): {YoutubeUrl}", youtubeUrl);
+                        }
+                        else
+                        {
+                            _queue.Writer.TryWrite(youtubeUrl);
+                            _logger.LogInformation("Comando recebido e adicionado à fila: {YoutubeUrl}", youtubeUrl);
+                        }
                     }
                 }
             }
-            await Task.Delay(2000);
+
+            await Task.Delay(PollIntervalMs, cancellationToken);
         }
     }
 
-    private async Task StartStreamingAsync(string serverId, string voiceChannelId, string youtubeUrl)
+    // Consumidor: toca a fila em sequência; ao esvaziar, aguarda IdleTimeout e sai da call.
+    private async Task ProcessQueueAsync(string serverId, string voiceChannelId, CancellationToken cancellationToken)
     {
-        Console.WriteLine("[INFO] Entrando no canal de voz...");
-        await _discordPage!.GotoAsync($"https://discord.com/channels/{serverId}/{voiceChannelId}");
-        await Task.Delay(3000);
+        bool inCall = false;
 
-        var joinVoiceButton = _discordPage.GetByRole(AriaRole.Button, new() { Name = "Entrar na chamada de voz" });
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            var youtubeUrl = await DequeueWithIdleTimeoutAsync(inCall, cancellationToken);
 
-        if (await joinVoiceButton.IsVisibleAsync(new() { Timeout = 5000 }))
+            if (youtubeUrl is null)
+            {
+                // Fila vazia por IdleTimeout enquanto na chamada → desconecta.
+                if (inCall)
+                {
+                    _logger.LogInformation("Fila vazia por {Minutos} min. Saindo do canal de voz.", IdleTimeout.TotalMinutes);
+                    await LeaveVoiceAsync();
+                    inCall = false;
+                }
+                continue;
+            }
+
+            if (!inCall)
+            {
+                await JoinVoiceAndShareAsync(serverId, voiceChannelId, youtubeUrl, cancellationToken);
+                inCall = true;
+            }
+            else
+            {
+                _logger.LogInformation("Próximo da fila. Trocando vídeo: {YoutubeUrl}", youtubeUrl);
+                await PlayVideoAsync(youtubeUrl, cancellationToken);
+            }
+
+            await WaitForVideoEndAsync(cancellationToken);
+            _logger.LogInformation("Reprodução finalizada.");
+        }
+    }
+
+    // Retira o próximo item. Se na chamada e a fila estiver vazia, aguarda no
+    // máximo IdleTimeout e retorna null (sinal para sair). Fora da chamada,
+    // aguarda indefinidamente pelo próximo comando.
+    private async Task<string?> DequeueWithIdleTimeoutAsync(bool applyIdleTimeout, CancellationToken cancellationToken)
+    {
+        if (_queue.Reader.TryRead(out var url))
+            return url;
+
+        if (!applyIdleTimeout)
+        {
+            while (await _queue.Reader.WaitToReadAsync(cancellationToken))
+                if (_queue.Reader.TryRead(out url))
+                    return url;
+            return null;
+        }
+
+        using var idleCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+        idleCts.CancelAfter(IdleTimeout);
+        try
+        {
+            while (await _queue.Reader.WaitToReadAsync(idleCts.Token))
+                if (_queue.Reader.TryRead(out url))
+                    return url;
+            return null;
+        }
+        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+        {
+            return null; // estourou o IdleTimeout (não o cancelamento global)
+        }
+    }
+
+    private async Task JoinVoiceAndShareAsync(string serverId, string voiceChannelId, string youtubeUrl, CancellationToken cancellationToken)
+    {
+        using var activity = DiagnosticsConfig.ActivitySource.StartActivity("JoinVoiceAndShare");
+        activity?.SetTag("youtube.url", youtubeUrl);
+
+        // Página dedicada ao canal de voz: NÃO reaproveita _discordPage,
+        // para que o loop de monitoramento continue no canal de texto.
+        _voicePage ??= await Context.NewPageAsync();
+        var voiceUrl = $"https://discord.com/channels/{serverId}/{voiceChannelId}";
+
+        // Abre o vídeo primeiro (aba dedicada); o compartilhamento captura essa aba.
+        await PlayVideoAsync(youtubeUrl, cancellationToken);
+
+        // O erro 3002 do Discord (falha de conexão RTC) impede os controles de
+        // transmissão de aparecerem. Recolocar-se na chamada (nova navegação +
+        // entrar) refaz a conexão — tentamos algumas vezes antes de desistir.
+        for (int attempt = 1; attempt <= ShareMaxAttempts && !cancellationToken.IsCancellationRequested; attempt++)
+        {
+            await NavigateAndJoinVoiceAsync(voiceUrl, cancellationToken);
+
+            if (await TryStartScreenShareAsync(cancellationToken))
+            {
+                _logger.LogInformation("Transmissão iniciada.");
+                return;
+            }
+
+            _logger.LogWarning(
+                "Não foi possível iniciar a transmissão (tentativa {Attempt}/{Max}); possível erro 3002. Refazendo a conexão de voz...",
+                attempt, ShareMaxAttempts);
+        }
+
+        await _voicePage.ScreenshotAsync(new() { Path = "erro_final_share.png" });
+        activity?.SetStatus(ActivityStatusCode.Error, "Não foi possível iniciar a transmissão (erro 3002?).");
+        _logger.LogError(
+            "Falha ao compartilhar a tela após {Max} tentativas. Verifique a conexão/VPN e o erro 3002 do Discord.",
+            ShareMaxAttempts);
+    }
+
+    private async Task NavigateAndJoinVoiceAsync(string voiceUrl, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation("Entrando no canal de voz...");
+        await _voicePage!.GotoAsync(voiceUrl);
+        await Task.Delay(VoiceJoinSettleMs, cancellationToken);
+
+        var joinVoiceButton = _voicePage.GetByRole(AriaRole.Button, new() { Name = JoinVoiceButtonLabel });
+        if (await joinVoiceButton.IsVisibleAsync(new() { Timeout = VoiceButtonTimeoutMs }))
         {
             await joinVoiceButton.ClickAsync();
-            Console.WriteLine("[INFO] Clique realizado no botão de entrar.");
-            await Task.Delay(2000);
+            _logger.LogInformation("Entrou no canal de voz.");
+            await Task.Delay(PollIntervalMs, cancellationToken);
         }
         else
         {
-            Console.WriteLine("[INFO] Botão de entrar não encontrado (pode já estar conectado).");
+            _logger.LogInformation("Botão de entrar não encontrado (pode já estar conectado).");
         }
+    }
 
-        var youtubePage = await _context!.NewPageAsync();
-        await youtubePage.GotoAsync(youtubeUrl);
-        await youtubePage.ClickAsync(".ytp-play-button", new PageClickOptions { Timeout = 5000 }).ContinueWith(t => { });
+    private async Task<bool> TryStartScreenShareAsync(CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        await _voicePage!.BringToFrontAsync();
+        try
+        {
+            var shareButton = _voicePage.GetByLabel(ShareScreenLabel);
+            await shareButton.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = ShareButtonTimeoutMs });
+            await shareButton.ClickAsync();
+            return true;
+        }
+        catch (TimeoutException)
+        {
+            // Botão indisponível — normalmente porque a conexão de voz falhou (3002).
+            return false;
+        }
+    }
 
-        await _discordPage.BringToFrontAsync();
+    private async Task PlayVideoAsync(string youtubeUrl, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        _youtubePage ??= await Context.NewPageAsync();
+
+        _logger.LogInformation("Reproduzindo: {YoutubeUrl}", youtubeUrl);
+        await _youtubePage.GotoAsync(youtubeUrl);
 
         try
         {
-            var shareButton = _discordPage.GetByLabel("Compartilhar sua tela");
-            await shareButton.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = 10000 });
-            await shareButton.ClickAsync();
-            Console.WriteLine("[INFO] Transmissão iniciada.");
+            await _youtubePage.WaitForSelectorAsync(VideoSelector, new() { Timeout = VideoReadyTimeoutMs });
+        }
+        catch (TimeoutException)
+        {
+            _logger.LogWarning("Player do YouTube não carregou a tempo para: {YoutubeUrl}", youtubeUrl);
+            return;
+        }
+
+        // Inicia a reprodução de forma idempotente (não pausa vídeo que já toca).
+        try
+        {
+            await _youtubePage.EvaluateAsync(
+                "async () => { const v = document.querySelector('video'); if (v) { try { await v.play(); } catch (e) {} } }");
         }
         catch (Exception ex)
         {
-            await _discordPage.ScreenshotAsync(new() { Path = "erro_final_share.png" });
-            Console.WriteLine($"[ERRO] Falha ao compartilhar: {ex.Message}");
+            _logger.LogDebug(ex, "Não foi possível iniciar a reprodução via script (opcional).");
+        }
+    }
+
+    // Aguarda o vídeo atual terminar (ou a página deixar de ter <video>).
+    private async Task WaitForVideoEndAsync(CancellationToken cancellationToken)
+    {
+        while (!cancellationToken.IsCancellationRequested)
+        {
+            bool ended;
+            try
+            {
+                ended = await _youtubePage!.EvaluateAsync<bool>(
+                    "() => { const v = document.querySelector('video'); if (!v) return true; " +
+                    "return v.ended || (v.duration > 0 && v.currentTime >= v.duration - 1.5); }");
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Falha ao ler o estado do vídeo; considerando finalizado.");
+                return;
+            }
+
+            if (ended)
+                return;
+
+            await Task.Delay(PlaybackPollMs, cancellationToken);
+        }
+    }
+
+    private async Task LeaveVoiceAsync()
+    {
+        if (_voicePage is null)
+            return;
+
+        try
+        {
+            var disconnect = _voicePage.GetByRole(AriaRole.Button, new() { Name = DisconnectButtonLabel });
+            if (await disconnect.IsVisibleAsync(new() { Timeout = VoiceButtonTimeoutMs }))
+            {
+                await disconnect.ClickAsync();
+                _logger.LogInformation("Desconectado do canal de voz.");
+            }
+            else
+            {
+                _logger.LogInformation("Botão de desconectar não encontrado (pode já estar fora da chamada).");
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Falha ao sair do canal de voz.");
+        }
+    }
+
+    private async Task<string> GetCurrentLastMessageIdAsync()
+    {
+        var messageLocators = DiscordPage.Locator(ChatMessageSelector);
+        int count = await messageLocators.CountAsync();
+        if (count == 0)
+            return "";
+
+        return await messageLocators.Nth(count - 1).GetAttributeAsync("data-list-item-id") ?? "";
+    }
+
+    private static bool IsAllowedYouTubeUrl(string url) =>
+        Uri.TryCreate(url, UriKind.Absolute, out var uri)
+        && (uri.Scheme == Uri.UriSchemeHttp || uri.Scheme == Uri.UriSchemeHttps)
+        && AllowedYouTubeHosts.Contains(uri.Host, StringComparer.OrdinalIgnoreCase);
+
+    public async ValueTask DisposeAsync()
+    {
+        try
+        {
+            if (_browser is not null)
+            {
+                // Fechar o browser encerra contexto e páginas associadas.
+                await _browser.CloseAsync();
+            }
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Falha ao fechar o browser durante o descarte.");
+        }
+        finally
+        {
+            _playwright?.Dispose();
+            GC.SuppressFinalize(this);
         }
     }
 }

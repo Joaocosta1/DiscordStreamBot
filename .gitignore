@@ -361,3 +361,9 @@ MigrationBackup/
 
 # Fody - auto-generated XML schema
 FodyWeavers.xsd
+
+# DiscordStreamBot — segredos e artefatos de runtime (não versionar)
+config.txt
+discord_session.json
+debug_error.png
+erro_final_share.png

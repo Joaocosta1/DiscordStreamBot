@@ -1,4 +1,4 @@
-﻿namespace Bot.Application.UseCases;
+namespace Bot.Application.UseCases;
 
 using Bot.Application.Interfaces;
 using Bot.Domain.Entities;
@@ -12,10 +12,10 @@ public class StartStreamingUseCase
         _browserService = browserService;
     }
 
-    public async Task ExecuteAsync(string email, string password, StreamSession session)
+    public async Task ExecuteAsync(string email, string password, StreamSession session, CancellationToken cancellationToken = default)
     {
-        await _browserService.StartBrowserAsync();
-        await _browserService.LoginToDiscordAsync(email, password);
-        await _browserService.ListenForCommandsAndStreamAsync(session.ServerId, session.TextChannelId, session.VoiceChannelId);
+        await _browserService.StartBrowserAsync(cancellationToken);
+        await _browserService.LoginToDiscordAsync(email, password, cancellationToken);
+        await _browserService.ListenForCommandsAndStreamAsync(session.ServerId, session.TextChannelId, session.VoiceChannelId, cancellationToken);
     }
 }
