@@ -9,6 +9,8 @@ namespace Bot.Application.Interfaces;
 public interface IBrowserAutomationService : IAsyncDisposable
 {
     Task StartBrowserAsync(CancellationToken cancellationToken = default);
+
     Task LoginToDiscordAsync(string email, string password, CancellationToken cancellationToken = default);
+
     Task ListenForCommandsAndStreamAsync(string serverId, string textChannelId, string voiceChannelId, CancellationToken cancellationToken = default);
 }

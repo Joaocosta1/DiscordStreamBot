@@ -1,10 +1,10 @@
 namespace Bot.Tests.UseCases;
 
-using Xunit;
-using Moq;
-using Bot.Application.UseCases;
 using Bot.Application.Interfaces;
+using Bot.Application.UseCases;
 using Bot.Domain.Entities;
+using Moq;
+using Xunit;
 
 public class StartStreamingUseCaseTests
 {

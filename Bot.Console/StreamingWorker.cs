@@ -1,9 +1,9 @@
 namespace Bot.Console;
 
-using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Logging;
 using Bot.Application.UseCases;
 using Bot.Domain.Entities;
+using Microsoft.Extensions.Hosting;
+using Microsoft.Extensions.Logging;
 
 /// <summary>
 /// Serviço hospedado que carrega a configuração e executa a automação até o
@@ -13,6 +13,7 @@ using Bot.Domain.Entities;
 public sealed class StreamingWorker : BackgroundService
 {
     private const string ConfigPath = "config.txt";
+
     private static readonly string[] RequiredKeys =
         { "EMAIL", "SENHA", "GUILD_ID", "TEXT_CHANNEL_ID", "VOICE_CHANNEL_ID" };
 

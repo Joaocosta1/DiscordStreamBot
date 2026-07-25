@@ -1,17 +1,19 @@
 namespace Bot.Infrastructure.Services;
 
+using Bot.Application.Interfaces;
+using Bot.Infrastructure.Diagnostics;
+using Microsoft.Extensions.Logging;
 using Microsoft.Playwright;
 using System.Diagnostics;
 using System.Threading.Channels;
-using Microsoft.Extensions.Logging;
-using Bot.Application.Interfaces;
-using Bot.Infrastructure.Diagnostics;
 
 public class PlaywrightDiscordService : IBrowserAutomationService
 {
     // Constantes de aplicação
     private const string SessionFile = "discord_session.json";
+
     private const string CommandPrefix = "!play ";
+
     // Canal do navegador instalado no sistema (Chrome/Edge) — tem os codecs
     // proprietários (H.264/AAC) e o Widevine que o YouTube exige. O Chromium
     // empacotado pelo Playwright NÃO os possui e falha ao reproduzir vídeos.
@@ -19,6 +21,7 @@ public class PlaywrightDiscordService : IBrowserAutomationService
 
     // Timeouts (ms) — centralizados para facilitar ajuste
     private const int LoginFieldTimeoutMs = 10_000;
+
     private const int LoginRedirectTimeoutMs = 60_000;
     private const int NavigationTimeoutMs = 60_000;
     private const int ModalTimeoutMs = 5_000;
@@ -37,6 +40,7 @@ public class PlaywrightDiscordService : IBrowserAutomationService
 
     // Seletores / rótulos da UI web do Discord (pt-BR) — dependentes de locale
     private const string ContinueInBrowserSelector = "text=Continuar no Navegador";
+
     private const string JoinVoiceButtonLabel = "Entrar na chamada de voz";
     private const string DisconnectButtonLabel = "Desconectar";
     private const string ShareScreenLabel = "Compartilhar sua tela";
