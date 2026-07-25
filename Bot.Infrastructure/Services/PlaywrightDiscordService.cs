@@ -28,8 +28,9 @@ public class PlaywrightDiscordService : IBrowserAutomationService
     private const int VideoReadyTimeoutMs = 15_000;
     private const int VoiceJoinSettleMs = 3_000;
     private const int VoiceButtonTimeoutMs = 5_000;
-    private const int ShareButtonTimeoutMs = 10_000;
+    private const int ShareButtonProbeMs = 4_000;
     private const int ShareMaxAttempts = 3;
+    private const int DeafenMaxProbes = 5;
 
     // Tempo ocioso na chamada (fila vazia) antes de desconectar
     private static readonly TimeSpan IdleTimeout = TimeSpan.FromMinutes(5);
@@ -90,7 +91,15 @@ public class PlaywrightDiscordService : IBrowserAutomationService
                 "--auto-select-desktop-capture-source=YouTube",
                 "--autoplay-policy=no-user-gesture-required",
                 "--disable-accelerated-video-encode",
-                "--mute-audio"
+                // Cria microfone/câmera falsos: o Discord exige um dispositivo de
+                // áudio para conectar na voz; sem isso dá erro 3002 (mic/áudio).
+                "--use-fake-device-for-media-stream",
+                // Impede o Chrome de estrangular a aba do YouTube quando ela fica
+                // em segundo plano (a de voz vem à frente para compartilhar), o que
+                // causava o "Algo deu errado" e travava a reprodução/áudio.
+                "--disable-background-timer-throttling",
+                "--disable-backgrounding-occluded-windows",
+                "--disable-renderer-backgrounding"
             }
         });
 
@@ -336,6 +345,11 @@ public class PlaywrightDiscordService : IBrowserAutomationService
             if (await TryStartScreenShareAsync(cancellationToken))
             {
                 _logger.LogInformation("Transmissão iniciada.");
+                // Traz a aba do YouTube de volta ao primeiro plano: em segundo
+                // plano o Chrome estrangula a página e o vídeo mostra "Algo deu
+                // errado". A captura de tela continua mesmo com ela em foco.
+                if (_youtubePage is not null)
+                    await _youtubePage.BringToFrontAsync();
                 return;
             }
 
@@ -345,6 +359,7 @@ public class PlaywrightDiscordService : IBrowserAutomationService
         }
 
         await _voicePage.ScreenshotAsync(new() { Path = "erro_final_share.png" });
+        await LogVoicePageStateAsync();
         activity?.SetStatus(ActivityStatusCode.Error, "Não foi possível iniciar a transmissão (erro 3002?).");
         _logger.LogError(
             "Falha ao compartilhar a tela após {Max} tentativas. Verifique a conexão/VPN e o erro 3002 do Discord.",
@@ -368,23 +383,117 @@ public class PlaywrightDiscordService : IBrowserAutomationService
         {
             _logger.LogInformation("Botão de entrar não encontrado (pode já estar conectado).");
         }
+
+        // Entra mudo: ativar o "surdo" também silencia o microfone.
+        await EnsureSelfDeafenedAsync();
+    }
+
+    // Garante que o bot esteja no modo "surdo" (mic mudo + sem áudio). Só clica se
+    // o botão indicar o estado "ativar" — evita desativar caso já esteja surdo
+    // (o estado persiste na sessão salva).
+    private async Task EnsureSelfDeafenedAsync()
+    {
+        if (_voicePage is null)
+            return;
+
+        // Clica no botão "surdo" apenas quando ele está no estado "ativar"
+        // (rótulo pt-BR começa com "Ativar..."; en: "Deafen"). Assim não desativa
+        // caso a sessão já esteja surda. Surdo também silencia o microfone.
+        const string script = @"() => {
+            const norm = s => (s || '').toLowerCase();
+            const btns = Array.from(document.querySelectorAll('button[aria-label]'));
+            const b = btns.find(x => {
+                const n = norm(x.getAttribute('aria-label'));
+                return n.includes('surdo') || n.includes('ensurdec') || n.includes('deafen');
+            });
+            if (!b) return 'notfound';
+            const label = b.getAttribute('aria-label');
+            const n = norm(label);
+            const activate = n.startsWith('ativar') || n.startsWith('deafen');
+            if (activate) { b.click(); return 'clicked:' + label; }
+            return 'already:' + label;
+        }";
+
+        // O painel de voz pode demorar a renderizar após entrar na call.
+        for (int i = 0; i < DeafenMaxProbes; i++)
+        {
+            try
+            {
+                var result = await _voicePage.EvaluateAsync<string>(script);
+                if (result != "notfound")
+                {
+                    _logger.LogInformation("Auto-surdo (mic + áudio mudos): {Result}", result);
+                    return;
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogDebug(ex, "Falha ao tentar ativar o modo surdo.");
+            }
+
+            await Task.Delay(VoiceJoinSettleMs);
+        }
+
+        _logger.LogWarning("Não foi possível ativar o modo surdo: botão do painel de voz não encontrado.");
     }
 
     private async Task<bool> TryStartScreenShareAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
         await _voicePage!.BringToFrontAsync();
+
+        // A UI do Discord (pt-BR) varia; tentamos alguns rótulos/roles do botão de tela.
+        ILocator[] candidates =
+        {
+            _voicePage.GetByLabel(ShareScreenLabel),
+            _voicePage.GetByLabel("Compartilhar tela"),
+            _voicePage.GetByRole(AriaRole.Button, new() { Name = ShareScreenLabel }),
+            _voicePage.GetByRole(AriaRole.Button, new() { Name = "Compartilhar tela" }),
+            _voicePage.GetByRole(AriaRole.Button, new() { Name = "Tela" }),
+        };
+
+        foreach (var candidate in candidates)
+        {
+            try
+            {
+                var target = candidate.First;
+                await target.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = ShareButtonProbeMs });
+                await target.ClickAsync();
+                return true;
+            }
+            catch (TimeoutException)
+            {
+                // tenta o próximo candidato
+            }
+        }
+
+        return false;
+    }
+
+    // Diagnóstico: quando o compartilhamento falha, registra os botões visíveis na
+    // página de voz e se o banner de erro 3002 está presente — para identificar se
+    // é rótulo divergente ou falha de conexão RTC do Discord.
+    private async Task LogVoicePageStateAsync()
+    {
+        if (_voicePage is null)
+            return;
+
         try
         {
-            var shareButton = _voicePage.GetByLabel(ShareScreenLabel);
-            await shareButton.WaitForAsync(new() { State = WaitForSelectorState.Visible, Timeout = ShareButtonTimeoutMs });
-            await shareButton.ClickAsync();
-            return true;
+            var has3002 = await _voicePage.EvaluateAsync<bool>(
+                "() => (document.body?.innerText ?? '').includes('3002')");
+            var labels = await _voicePage.EvaluateAsync<string[]>(
+                "() => Array.from(document.querySelectorAll('button,[role=button]'))" +
+                ".map(b => (b.getAttribute('aria-label') || b.textContent || '').trim())" +
+                ".filter(t => t).slice(0, 60)");
+
+            _logger.LogWarning(
+                "Diagnóstico da página de voz — banner 3002 presente: {Has3002}; botões: {Buttons}",
+                has3002, string.Join(" | ", labels));
         }
-        catch (TimeoutException)
+        catch (Exception ex)
         {
-            // Botão indisponível — normalmente porque a conexão de voz falhou (3002).
-            return false;
+            _logger.LogDebug(ex, "Não foi possível coletar o diagnóstico da página de voz.");
         }
     }
 
